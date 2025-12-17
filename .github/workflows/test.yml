@@ -1,16 +1,19 @@
-name: Deploy Database Changes
+name: Database Schema Change
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'migrations/**'
 
 permissions:
-  id-token: write  # Required for OIDC token
+  id-token: write
   contents: read
 
 env:
   BYTEBASE_URL: https://valid-just-tadpole.ngrok-free.app
   WORKLOAD_IDENTITY_EMAIL: github-deploy@workload.bytebase.com
+  PROJECT: projects/project-sample
 
 jobs:
   deploy:
@@ -19,8 +22,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get Bytebase Token
-        id: bytebase-token
+      - name: Get OIDC Token
+        id: oidc
         uses: actions/github-script@v7
         with:
           script: |
@@ -28,18 +31,56 @@ jobs:
             core.setSecret(token);
             core.setOutput('token', token);
 
-      - name: Exchange for Bytebase API Token
-        id: exchange
+      - name: Exchange Token
+        id: auth
         run: |
           RESPONSE=$(curl -s -X POST "${BYTEBASE_URL}/v1/auth:exchangeToken" \
             -H "Content-Type: application/json" \
-            -d "{\"token\": \"${{ steps.bytebase-token.outputs.token }}\", \"email\": \"${WORKLOAD_IDENTITY_EMAIL}\"}")
+            -d "{\"token\": \"${{ steps.oidc.outputs.token }}\", \"email\": \"${WORKLOAD_IDENTITY_EMAIL}\"}")
 
           ACCESS_TOKEN=$(echo $RESPONSE | jq -r '.accessToken')
+          if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Failed to get access token"
+            echo $RESPONSE
+            exit 1
+          fi
+
           echo "::add-mask::$ACCESS_TOKEN"
           echo "access_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
 
-      - name: Call Bytebase API
+      - name: Create Plan
+        id: plan
         run: |
-          curl -s "${BYTEBASE_URL}/v1/projects" \
-            -H "Authorization: Bearer ${{ steps.exchange.outputs.access_token }}"
+          # Read migration SQL file
+          SQL_CONTENT=$(cat migrations/latest.sql | jq -Rs .)
+
+          RESPONSE=$(curl -s -X POST "${BYTEBASE_URL}/v1/${PROJECT}/plans" \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.access_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"title\": \"Migration from GitHub Actions\",
+              \"steps\": [{
+                \"specs\": [{
+                  \"changeDatabaseConfig\": {
+                    \"target\": \"instances/prod/databases/mydb\",
+                    \"type\": \"MIGRATE\",
+                    \"sheet\": \"${SQL_CONTENT}\"
+                  }
+                }]
+              }]
+            }")
+
+          PLAN_NAME=$(echo $RESPONSE | jq -r '.name')
+          echo "plan_name=$PLAN_NAME" >> $GITHUB_OUTPUT
+
+      - name: Create Issue and Rollout
+        run: |
+          # Create issue
+          curl -s -X POST "${BYTEBASE_URL}/v1/${PROJECT}/issues" \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.access_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"title\": \"Schema migration\",
+              \"type\": \"DATABASE_CHANGE\",
+              \"plan\": \"${{ steps.plan.outputs.plan_name }}\"
+            }"
